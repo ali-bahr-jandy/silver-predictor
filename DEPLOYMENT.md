@@ -21,6 +21,7 @@ nano .env
 ```
 
 Add your environment variables to `.env`:
+
 ```env
 # Database
 DB_HOST=postgres
@@ -51,13 +52,13 @@ Go to your GitHub repository: https://github.com/ali-bahr-jandy/silver-predictor
 1. Click on **Settings** → **Secrets and variables** → **Actions**
 2. Click **New repository secret** and add these secrets:
 
-| Secret Name | Description | Example |
-|-------------|-------------|---------|
-| `SERVER_HOST` | Your server IP or domain | `123.45.67.89` or `example.com` |
-| `SERVER_USERNAME` | SSH username | `root` or `ubuntu` |
-| `SSH_PRIVATE_KEY` | Your SSH private key | Copy from `~/.ssh/id_rsa` |
-| `SERVER_PORT` | SSH port (optional) | `22` (default) |
-| `DEPLOY_PATH` | Full path on server | `/home/user/apps/silver-predictor` |
+| Secret Name       | Description              | Example                            |
+| ----------------- | ------------------------ | ---------------------------------- |
+| `SERVER_HOST`     | Your server IP or domain | `123.45.67.89` or `example.com`    |
+| `SERVER_USERNAME` | SSH username             | `root` or `ubuntu`                 |
+| `SSH_PRIVATE_KEY` | Your SSH private key     | Copy from `~/.ssh/id_rsa`          |
+| `SERVER_PORT`     | SSH port (optional)      | `22` (default)                     |
+| `DEPLOY_PATH`     | Full path on server      | `/home/user/apps/silver-predictor` |
 
 ### 3. Generate SSH Key (if needed)
 
@@ -101,6 +102,7 @@ cd /path/to/silver-predictor
 ### 6. Automatic Deployment
 
 Now, every time you push to the `main` branch:
+
 1. GitHub Actions will trigger automatically
 2. Connect to your server via SSH
 3. Pull the latest code
@@ -129,16 +131,19 @@ docker-compose down
 ### Troubleshooting
 
 **GitHub Action fails to connect:**
+
 - Verify SSH_PRIVATE_KEY secret is correct (entire key including headers)
 - Check SERVER_HOST and SERVER_USERNAME
 - Ensure firewall allows SSH connections
 
 **Docker build fails:**
+
 - Check .env file exists on server
 - Verify environment variables are set correctly
 - Check Docker logs: `docker-compose logs`
 
 **App won't start:**
+
 - Check logs: `docker-compose logs app`
 - Verify database is running: `docker-compose ps`
 - Ensure .env file has all required variables
