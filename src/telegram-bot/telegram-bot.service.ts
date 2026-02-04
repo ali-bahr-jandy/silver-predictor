@@ -1089,11 +1089,15 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private async sendStatusReport(ctx: any) {
     try {
       const chatId = ctx.chat?.id?.toString();
-      
-      // Get current prices
+
+      // Get current prices - fetch if not cached
       let prices: any = null;
       if (this.priceFetcher) {
         prices = this.priceFetcher.getLastPrices();
+        // If no cached prices, fetch them now
+        if (!prices) {
+          prices = await this.priceFetcher.fetchAllPrices();
+        }
       }
 
       // Get wallet state
