@@ -10,12 +10,21 @@ import { Repository } from "typeorm";
 import { AuthState } from "../database/entities/auth-state.entity";
 import { BrowserSessionService } from "./browser-session.service";
 
+// Per-user auth state (in-memory)
+interface UserAuthState {
+  accessToken: string | null;
+  phoneNumber: string | null;
+  awaitingPhone: boolean;
+  awaitingOtp: boolean;
+}
+
 @Injectable()
 export class NoghreseaAuthService implements OnModuleInit {
   private readonly logger = new Logger(NoghreseaAuthService.name);
   private readonly baseUrl = "https://api.noghresea.ir";
-  private accessToken: string | null = null;
-  private currentPhoneNumber: string | null = null;
+
+  // Per-user authentication state
+  private userStates: Map<string, UserAuthState> = new Map();
 
   constructor(
     @InjectRepository(AuthState)
@@ -25,47 +34,82 @@ export class NoghreseaAuthService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    await this.loadTokenFromDb();
+    // No longer load global token - each user manages their own
+    this.logger.log("NoghreseaAuthService initialized - per-user auth enabled");
   }
 
-  private async loadTokenFromDb() {
-    try {
-      // Try to load any valid token
-      const auth = await this.authStateRepo.findOne({
-        where: { isValid: true },
-        order: { tokenExpiresAt: "DESC" },
+  private getUserState(chatId: string): UserAuthState {
+    if (!this.userStates.has(chatId)) {
+      this.userStates.set(chatId, {
+        accessToken: null,
+        phoneNumber: null,
+        awaitingPhone: false,
+        awaitingOtp: false,
       });
+    }
+    return this.userStates.get(chatId)!;
+  }
+
+  async loadUserAuth(chatId: string): Promise<void> {
+    try {
+      const auth = await this.authStateRepo.findOne({
+        where: { telegramChatId: chatId, isValid: true },
+      });
+
+      const state = this.getUserState(chatId);
       if (auth && auth.isValid && auth.accessToken) {
-        this.accessToken = auth.accessToken;
-        this.currentPhoneNumber = auth.phoneNumber;
-        this.logger.log("✅ Loaded existing auth token from DB");
-      } else {
-        this.logger.log("ℹ️ No valid auth token found in DB");
+        state.accessToken = auth.accessToken;
+        state.phoneNumber = auth.phoneNumber;
+        this.logger.log(`✅ Loaded auth for chat ${chatId}`);
       }
     } catch (e) {
-      this.logger.warn("Could not load auth from DB");
+      this.logger.warn(`Could not load auth for chat ${chatId}`);
     }
   }
 
-  setPhoneNumber(phoneNumber: string) {
-    this.currentPhoneNumber = phoneNumber;
+  // State management for awaiting input
+  setAwaitingPhone(chatId: string, value: boolean) {
+    const state = this.getUserState(chatId);
+    state.awaitingPhone = value;
+    if (value) state.awaitingOtp = false;
   }
 
-  getPhoneNumber(): string | null {
-    return this.currentPhoneNumber;
+  setAwaitingOtp(chatId: string, value: boolean) {
+    const state = this.getUserState(chatId);
+    state.awaitingOtp = value;
+    if (value) state.awaitingPhone = false;
   }
 
-  async sendOtp(phoneNumber?: string): Promise<boolean> {
-    const phone = phoneNumber || this.currentPhoneNumber;
+  isAwaitingPhone(chatId: string): boolean {
+    return this.getUserState(chatId).awaitingPhone;
+  }
+
+  isAwaitingOtp(chatId: string): boolean {
+    return this.getUserState(chatId).awaitingOtp;
+  }
+
+  setPhoneNumber(chatId: string, phoneNumber: string) {
+    this.getUserState(chatId).phoneNumber = phoneNumber;
+  }
+
+  getPhoneNumber(chatId?: string): string | null {
+    if (!chatId) return null;
+    return this.getUserState(chatId).phoneNumber;
+  }
+
+  async sendOtp(chatId: string, phoneNumber?: string): Promise<boolean> {
+    const state = this.getUserState(chatId);
+    const phone = phoneNumber || state.phoneNumber;
+
     if (!phone) {
-      this.logger.error("No phone number provided for OTP");
+      this.logger.error(`No phone number provided for OTP (chat: ${chatId})`);
       return false;
     }
 
-    this.currentPhoneNumber = phone;
+    state.phoneNumber = phone;
 
     try {
-      this.logger.log(`Sending OTP request to ${phone}...`);
+      this.logger.log(`Sending OTP request to ${phone} for chat ${chatId}...`);
 
       // Use browser session to bypass ArvanCloud protection
       const response = await this.browserSession.makeRequest(
@@ -90,10 +134,14 @@ export class NoghreseaAuthService implements OnModuleInit {
     }
   }
 
-  async verifyOtp(otp: string): Promise<boolean> {
-    const phoneNumber = this.currentPhoneNumber;
+  async verifyOtp(chatId: string, otp: string): Promise<boolean> {
+    const state = this.getUserState(chatId);
+    const phoneNumber = state.phoneNumber;
+
     if (!phoneNumber) {
-      this.logger.error("No phone number set for OTP verification");
+      this.logger.error(
+        `No phone number set for OTP verification (chat: ${chatId})`,
+      );
       return false;
     }
 
@@ -106,7 +154,7 @@ export class NoghreseaAuthService implements OnModuleInit {
       );
 
       if (response.accessToken) {
-        this.accessToken = response.accessToken;
+        state.accessToken = response.accessToken;
 
         // Decode JWT to get expiry
         const payload = JSON.parse(
@@ -114,46 +162,62 @@ export class NoghreseaAuthService implements OnModuleInit {
         );
         const expiresAt = new Date(payload.exp * 1000);
 
-        // Save to DB
-        let auth = await this.authStateRepo.findOne({ where: { phoneNumber } });
+        // Save to DB - per user
+        let auth = await this.authStateRepo.findOne({
+          where: { telegramChatId: chatId },
+        });
+
         if (!auth) {
-          auth = this.authStateRepo.create({ phoneNumber });
+          auth = this.authStateRepo.create({
+            telegramChatId: chatId,
+            phoneNumber,
+          });
         }
-        auth.accessToken = this.accessToken!;
+
+        auth.phoneNumber = phoneNumber;
+        auth.accessToken = state.accessToken!;
         auth.tokenExpiresAt = expiresAt;
         auth.isValid = true;
         await this.authStateRepo.save(auth);
 
         this.logger.log(
-          `✅ Authentication successful, expires: ${expiresAt.toISOString()}`,
+          `✅ Authentication successful for chat ${chatId}, expires: ${expiresAt.toISOString()}`,
         );
         return true;
       }
       return false;
     } catch (error) {
-      this.logger.error("Failed to verify OTP", error.message);
+      this.logger.error(
+        `Failed to verify OTP for chat ${chatId}`,
+        error.message,
+      );
       return false;
     }
   }
 
-  getToken(): string | null {
-    return this.accessToken;
+  getToken(chatId?: string): string | null {
+    if (!chatId) return null;
+    return this.getUserState(chatId).accessToken;
   }
 
-  isAuthenticated(): boolean {
-    if (!this.accessToken) return false;
-
-    // Check if token is expired by checking DB
-    return true; // Token exists, let API validate it
+  isAuthenticated(chatId?: string): boolean {
+    if (!chatId) return false;
+    const state = this.getUserState(chatId);
+    return !!state.accessToken;
   }
 
-  async invalidateToken() {
-    this.accessToken = null;
-    const phoneNumber = this.currentPhoneNumber;
-    if (phoneNumber) {
-      await this.authStateRepo.update({ phoneNumber }, { isValid: false });
-    }
-    this.currentPhoneNumber = null;
-    this.logger.warn("Token invalidated");
+  async invalidateToken(chatId: string) {
+    const state = this.getUserState(chatId);
+    state.accessToken = null;
+    state.phoneNumber = null;
+    state.awaitingOtp = false;
+    state.awaitingPhone = false;
+
+    await this.authStateRepo.update(
+      { telegramChatId: chatId },
+      { isValid: false },
+    );
+
+    this.logger.warn(`Token invalidated for chat ${chatId}`);
   }
 }

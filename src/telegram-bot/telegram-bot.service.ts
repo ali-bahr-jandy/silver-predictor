@@ -30,14 +30,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramBotService.name);
   private bot: Telegraf;
   private chatId: string | null = null;
-  private awaitingOtp = false;
-  private awaitingPhone = false; // For phone number input
+  // Removed global awaitingOtp and awaitingPhone - now per-user in authService
   private tradeExecutor: any = null; // Will be injected later to avoid circular dep
   private dailyAnalysis: DailyAnalysisService | null = null;
   private transactionService: TransactionService | null = null;
   private priceFetcher: any = null;
   private patternAnalyzer: any = null;
-  private manualTradeState: ManualTradeState | null = null; // For manual buy/sell flow
+  private manualTradeState: Map<string, ManualTradeState> = new Map(); // Per-user trade state
 
   constructor(
     private configService: ConfigService,
@@ -196,8 +195,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Start command
     this.bot.command("start", async (ctx) => {
-      this.chatId = ctx.chat.id.toString();
-      this.logger.log(`Chat ID set: ${this.chatId}`);
+      const chatId = ctx.chat.id.toString();
+      this.chatId = chatId;
+      this.logger.log(`Chat ID set: ${chatId}`);
+
+      // Load user's authentication state from DB
+      await this.authService.loadUserAuth(chatId);
 
       await ctx.reply(
         "🪙 *Silver Predictor Bot*\n\n" +
@@ -215,8 +218,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         },
       );
 
-      // Check auth status
-      if (!this.authService.isAuthenticated()) {
+      // Check auth status for THIS user
+      if (!this.authService.isAuthenticated(chatId)) {
         await ctx.reply(
           "⚠️ *Not Authenticated*\n\nYou need to authenticate with Noghresea to start trading.",
           {
@@ -251,8 +254,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Auth button
     this.bot.hears("🔐 Auth", async (ctx) => {
-      if (this.authService.isAuthenticated()) {
-        const phone = this.authService.getPhoneNumber();
+      const chatId = ctx.chat.id.toString();
+
+      // Load user auth state first
+      await this.authService.loadUserAuth(chatId);
+
+      if (this.authService.isAuthenticated(chatId)) {
+        const phone = this.authService.getPhoneNumber(chatId);
         const maskedPhone = phone
           ? phone.replace(/(\d{4})(\d{3})(\d{4})/, "$1***$3")
           : "N/A";
@@ -262,8 +270,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           },
         });
       } else {
-        this.awaitingPhone = true;
-        this.awaitingOtp = false;
+        this.authService.setAwaitingPhone(chatId, true);
         await ctx.reply(
           "🔒 Authentication Required\n\n" +
             "Please enter your phone number:\n" +
@@ -275,7 +282,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // Logout action
     this.bot.action("logout", async (ctx) => {
       await ctx.answerCbQuery();
-      await this.authService.invalidateToken();
+      const chatId = ctx.chat?.id.toString();
+      if (chatId) {
+        await this.authService.invalidateToken(chatId);
+      }
       await ctx.editMessageText(
         "🚪 Logged out successfully!\n\nTap 🔐 Auth to login with a new phone number.",
       );
@@ -284,11 +294,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // Send OTP action (legacy, kept for compatibility)
     this.bot.action("send_otp", async (ctx) => {
       await ctx.answerCbQuery();
-      const success = await this.authService.sendOtp();
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId) return;
+
+      const success = await this.authService.sendOtp(chatId);
 
       if (success) {
-        this.awaitingOtp = true;
-        this.awaitingPhone = false;
+        this.authService.setAwaitingOtp(chatId, true);
         await ctx.reply(
           "✅ OTP sent to your phone!\n\nPlease enter the OTP code:",
         );
@@ -300,9 +312,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // OTP input, phone input, and custom amount handler
     this.bot.on("text", async (ctx, next) => {
       const text = ctx.message.text.trim();
+      const chatId = ctx.chat.id.toString();
 
-      // Handle phone number input
-      if (this.awaitingPhone) {
+      // Handle phone number input - per user
+      if (this.authService.isAwaitingPhone(chatId)) {
         // Validate Iranian phone number format
         const phoneRegex = /^(09\d{9}|۰۹[\d۰-۹]{9})$/;
         // Convert Persian digits to English
@@ -315,14 +328,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
             ? normalizedPhone
             : text;
 
-          this.authService.setPhoneNumber(phone);
+          this.authService.setPhoneNumber(chatId, phone);
           await ctx.reply(`📱 Phone: ${phone}\n\nSending OTP...`);
 
-          const success = await this.authService.sendOtp(phone);
+          const success = await this.authService.sendOtp(chatId, phone);
 
           if (success) {
-            this.awaitingPhone = false;
-            this.awaitingOtp = true;
+            this.authService.setAwaitingPhone(chatId, false);
+            this.authService.setAwaitingOtp(chatId, true);
             await ctx.reply(
               "✅ *OTP Sent!*\n\nPlease enter the 5 or 6 digit code:",
               { parse_mode: "Markdown" },
@@ -342,11 +355,11 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // Handle OTP input
-      if (this.awaitingOtp) {
+      // Handle OTP input - per user
+      if (this.authService.isAwaitingOtp(chatId)) {
         if (/^\d{5,6}$/.test(text)) {
-          const success = await this.authService.verifyOtp(text);
-          this.awaitingOtp = false;
+          const success = await this.authService.verifyOtp(chatId, text);
+          this.authService.setAwaitingOtp(chatId, false);
 
           if (success) {
             await ctx.reply(
@@ -362,8 +375,9 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // Handle custom amount input for manual trading
-      if (this.manualTradeState && this.manualTradeState.awaitingAmount) {
+      // Handle custom amount input for manual trading - per user
+      const tradeState = this.manualTradeState.get(chatId);
+      if (tradeState && tradeState.awaitingAmount) {
         const input = text.replace(/,/g, "");
         const amount = parseFloat(input);
 
@@ -373,24 +387,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         }
 
         // API price is in thousands, real price = apiPrice * 1000
-        const pricePerGram = this.manualTradeState.currentPrice * 1000;
+        const pricePerGram = tradeState.currentPrice * 1000;
 
-        if (this.manualTradeState.action === "buy") {
+        if (tradeState.action === "buy") {
           // Validate buy amount (in Toman)
           if (amount < 100000) {
             await ctx.reply("❌ Minimum buy amount is 100,000 Toman.");
             return;
           }
-          if (amount > this.manualTradeState.maxAmount) {
+          if (amount > tradeState.maxAmount) {
             await ctx.reply(
-              `❌ Amount exceeds your balance (${this.manualTradeState.maxAmount.toLocaleString()} Toman).`,
+              `❌ Amount exceeds your balance (${tradeState.maxAmount.toLocaleString()} Toman).`,
             );
             return;
           }
 
           // Calculate grams: Toman / pricePerGram
           const grams = Math.floor((amount / pricePerGram) * 1000) / 1000;
-          this.manualTradeState.awaitingAmount = false;
+          tradeState.awaitingAmount = false;
 
           await ctx.reply(
             `⚠️ *Confirm Purchase*\n\n` +
@@ -412,13 +426,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
             },
           );
           return;
-        } else if (this.manualTradeState.action === "sell") {
+        } else if (tradeState.action === "sell") {
           // Validate sell amount (in grams)
           const minGrams = 100000 / pricePerGram;
 
-          if (amount > this.manualTradeState.maxAmount) {
+          if (amount > tradeState.maxAmount) {
             await ctx.reply(
-              `❌ Amount exceeds your balance (${this.manualTradeState.maxAmount.toFixed(3)} grams).`,
+              `❌ Amount exceeds your balance (${tradeState.maxAmount.toFixed(3)} grams).`,
             );
             return;
           }
@@ -431,7 +445,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           }
 
           const totalValue = Math.floor(amount * pricePerGram);
-          this.manualTradeState.awaitingAmount = false;
+          tradeState.awaitingAmount = false;
 
           await ctx.reply(
             `⚠️ *Confirm Sale*\n\n` +
@@ -580,10 +594,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // 💰 Buy Handler
     this.bot.hears("💰 Buy", async (ctx) => {
-      if (!this.authService.isAuthenticated()) {
+      const chatId = ctx.chat.id.toString();
+      if (!this.authService.isAuthenticated(chatId)) {
         await ctx.reply("❌ Not authenticated! Use 🔐 Auth first.");
         return;
       }
+
+      // Set active chat ID for API calls
+      this.noghreseaApi.setActiveChatId(chatId);
 
       try {
         await ctx.reply("💰 Checking your balance...");
@@ -618,13 +636,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const safeBalance = Math.floor(tomanBalance * 0.99);
         const maxGrams = Math.floor((safeBalance / pricePerGram) * 1000) / 1000;
 
-        // Store state for follow-up
-        this.manualTradeState = {
+        // Store state for follow-up - per user
+        const chatId = ctx.chat.id.toString();
+        this.manualTradeState.set(chatId, {
           action: "buy",
           awaitingAmount: false,
           maxAmount: safeBalance, // Use safe balance instead of full balance
           currentPrice: currentPrice, // Keep API price format
-        };
+        });
 
         await ctx.reply(
           `💰 *Buy Silver*\n\n` +
@@ -654,7 +673,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // 📤 Sell Handler
     this.bot.hears("📤 Sell", async (ctx) => {
-      if (!this.authService.isAuthenticated()) {
+      const chatId = ctx.chat.id.toString();
+      if (!this.authService.isAuthenticated(chatId)) {
         await ctx.reply("❌ Not authenticated! Use 🔐 Auth first.");
         return;
       }
@@ -687,13 +707,13 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
         const totalValue = Math.floor(silverBalance * currentPrice);
 
-        // Store state for follow-up
-        this.manualTradeState = {
+        // Store state for follow-up - per user
+        this.manualTradeState.set(chatId, {
           action: "sell",
           awaitingAmount: false,
           maxAmount: silverBalance,
           currentPrice: currentPrice,
-        };
+        });
 
         await ctx.reply(
           `📤 *Sell Silver*\n\n` +
@@ -723,12 +743,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Buy Max callback
     this.bot.action("buy_max", async (ctx) => {
-      if (!this.manualTradeState || this.manualTradeState.action !== "buy") {
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
+      if (!tradeState || tradeState.action !== "buy") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
 
-      const { maxAmount, currentPrice } = this.manualTradeState;
+      const { maxAmount, currentPrice } = tradeState;
       // currentPrice is API price (in thousands), real price = currentPrice * 1000
       const pricePerGram = currentPrice * 1000;
       const grams = Math.floor((maxAmount / pricePerGram) * 1000) / 1000;
@@ -754,18 +776,20 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Buy Custom callback
     this.bot.action("buy_custom", async (ctx) => {
-      if (!this.manualTradeState || this.manualTradeState.action !== "buy") {
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
+      if (!tradeState || tradeState.action !== "buy") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
 
-      this.manualTradeState.awaitingAmount = true;
+      tradeState.awaitingAmount = true;
 
       await ctx.answerCbQuery();
       await ctx.editMessageText(
         `✏️ *Enter Buy Amount*\n\n` +
           `Enter the amount in Toman (minimum 100,000):\n` +
-          `Your max: ${this.manualTradeState.maxAmount.toLocaleString()} Toman\n\n` +
+          `Your max: ${tradeState.maxAmount.toLocaleString()} Toman\n\n` +
           `Example: \`500000\` for 500,000 Toman`,
         { parse_mode: "Markdown" },
       );
@@ -773,12 +797,14 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Sell All callback
     this.bot.action("sell_all", async (ctx) => {
-      if (!this.manualTradeState || this.manualTradeState.action !== "sell") {
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
+      if (!tradeState || tradeState.action !== "sell") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
 
-      const { maxAmount, currentPrice } = this.manualTradeState;
+      const { maxAmount, currentPrice } = tradeState;
       // currentPrice is API price (in thousands), real price = currentPrice * 1000
       const pricePerGram = currentPrice * 1000;
       const totalValue = Math.floor(maxAmount * pricePerGram);
@@ -807,22 +833,24 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Sell Custom callback
     this.bot.action("sell_custom", async (ctx) => {
-      if (!this.manualTradeState || this.manualTradeState.action !== "sell") {
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
+      if (!tradeState || tradeState.action !== "sell") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
 
-      this.manualTradeState.awaitingAmount = true;
+      tradeState.awaitingAmount = true;
 
       // Calculate minimum grams for 100,000 Toman
-      const pricePerGram = this.manualTradeState.currentPrice * 1000;
+      const pricePerGram = tradeState.currentPrice * 1000;
       const minGrams = (100000 / pricePerGram).toFixed(3);
 
       await ctx.answerCbQuery();
       await ctx.editMessageText(
         `✏️ *Enter Sell Amount*\n\n` +
           `Enter the amount in grams:\n` +
-          `Your balance: ${this.manualTradeState.maxAmount.toFixed(3)} grams\n` +
+          `Your balance: ${tradeState.maxAmount.toFixed(3)} grams\n` +
           `Minimum: ${minGrams} grams (100,000 Toman)\n\n` +
           `Example: \`0.5\` for 0.5 grams`,
         { parse_mode: "Markdown" },
@@ -831,7 +859,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
     // Trade Cancel callback
     this.bot.action("trade_cancel", async (ctx) => {
-      this.manualTradeState = null;
+      const chatId = ctx.chat?.id.toString();
+      if (chatId) this.manualTradeState.delete(chatId);
       await ctx.answerCbQuery("Cancelled");
       await ctx.editMessageText("❌ Trade cancelled.");
     });
@@ -839,8 +868,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // Confirm Buy callback
     this.bot.action(/confirm_buy_(.+)/, async (ctx) => {
       const grams = parseFloat(ctx.match[1]);
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
 
-      if (!this.manualTradeState || this.manualTradeState.action !== "buy") {
+      if (!tradeState || tradeState.action !== "buy") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
@@ -853,11 +884,11 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const volumeInMilligrams = Math.round(grams * 1000);
 
         const result = await this.noghreseaApi.createBuyOrder(
-          this.manualTradeState.currentPrice,
+          tradeState.currentPrice,
           volumeInMilligrams,
         );
 
-        this.manualTradeState = null;
+        if (chatId) this.manualTradeState.delete(chatId);
 
         if (result && result.orderId) {
           await ctx.editMessageText(
@@ -873,7 +904,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           );
         }
       } catch (error: any) {
-        this.manualTradeState = null;
+        if (chatId) this.manualTradeState.delete(chatId);
         await ctx.editMessageText(`❌ Error: ${error.message}`);
       }
     });
@@ -881,8 +912,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     // Confirm Sell callback
     this.bot.action(/confirm_sell_(.+)/, async (ctx) => {
       const grams = parseFloat(ctx.match[1]);
+      const chatId = ctx.chat?.id.toString();
+      const tradeState = chatId ? this.manualTradeState.get(chatId) : null;
 
-      if (!this.manualTradeState || this.manualTradeState.action !== "sell") {
+      if (!tradeState || tradeState.action !== "sell") {
         await ctx.answerCbQuery("Session expired. Try again.");
         return;
       }
@@ -895,12 +928,12 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         const volumeInMilligrams = Math.round(grams * 1000);
 
         const result = await this.noghreseaApi.createSellOrder(
-          this.manualTradeState.currentPrice,
+          tradeState.currentPrice,
           volumeInMilligrams,
         );
 
-        const pricePerGram = this.manualTradeState.currentPrice * 1000;
-        this.manualTradeState = null;
+        const pricePerGram = tradeState.currentPrice * 1000;
+        if (chatId) this.manualTradeState.delete(chatId);
 
         if (result && result.orderId) {
           await ctx.editMessageText(
@@ -917,7 +950,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
           );
         }
       } catch (error: any) {
-        this.manualTradeState = null;
+        if (chatId) this.manualTradeState.delete(chatId);
         await ctx.editMessageText(`❌ Error: ${error.message}`);
       }
     });
@@ -1055,6 +1088,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
   private async sendStatusReport(ctx: any) {
     try {
+      const chatId = ctx.chat?.id?.toString();
+      
       // Get current prices
       let prices: any = null;
       if (this.priceFetcher) {
@@ -1063,7 +1098,8 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
 
       // Get wallet state
       let wallet = { tomanBalance: 0, silverBalance: 0 };
-      if (this.tradeExecutor) {
+      if (this.tradeExecutor && chatId) {
+        this.noghreseaApi.setActiveChatId(chatId);
         try {
           wallet = await this.tradeExecutor.getWalletState();
         } catch (e) {
@@ -1094,7 +1130,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       message += `├── Toman: ${wallet.tomanBalance.toLocaleString()}\n`;
       message += `└── Silver: ${wallet.silverBalance.toFixed(2)}g\n\n`;
 
-      message += `🔐 *Auth:* ${this.authService.isAuthenticated() ? "✅ Authenticated" : "❌ Not authenticated"}\n`;
+      message += `🔐 *Auth:* ${chatId && this.authService.isAuthenticated(chatId) ? "✅ Authenticated" : "❌ Not authenticated"}\n`;
       message += `⚡ *Trading:* ${tradingEnabled ? "✅ ENABLED" : "❌ DISABLED"}\n`;
 
       if (tradingStatus?.pausedUntil) {
@@ -1331,10 +1367,14 @@ ${patterns}
 
   // Handle Buy command from middleware
   private async handleBuyCommand(ctx: any) {
-    if (!this.authService.isAuthenticated()) {
+    const chatId = ctx.chat?.id?.toString();
+    if (!chatId || !this.authService.isAuthenticated(chatId)) {
       await ctx.reply("❌ Not authenticated! Use Auth button first.");
       return;
     }
+
+    // Set active chat ID for API calls
+    this.noghreseaApi.setActiveChatId(chatId);
 
     try {
       await ctx.reply("💰 Checking your balance...");
@@ -1367,12 +1407,13 @@ ${patterns}
       // Calculate max grams (Toman / pricePerGram)
       const maxGrams = Math.floor((tomanBalance / pricePerGram) * 1000) / 1000;
 
-      this.manualTradeState = {
+      const chatId = ctx.chat.id.toString();
+      this.manualTradeState.set(chatId, {
         action: "buy",
         awaitingAmount: false,
         maxAmount: tomanBalance,
         currentPrice: apiPrice, // Store API price for order
-      };
+      });
 
       await ctx.reply(
         `💰 *Buy Silver*\n\n` +
@@ -1402,10 +1443,14 @@ ${patterns}
 
   // Handle Sell command from middleware
   private async handleSellCommand(ctx: any) {
-    if (!this.authService.isAuthenticated()) {
+    const chatId = ctx.chat?.id?.toString();
+    if (!chatId || !this.authService.isAuthenticated(chatId)) {
       await ctx.reply("❌ Not authenticated! Use Auth button first.");
       return;
     }
+
+    // Set active chat ID for API calls
+    this.noghreseaApi.setActiveChatId(chatId);
 
     try {
       await ctx.reply("📤 Checking your silver balance...");
@@ -1449,12 +1494,13 @@ ${patterns}
 
       const totalValue = Math.floor(silverBalance * pricePerGram);
 
-      this.manualTradeState = {
+      const chatId = ctx.chat.id.toString();
+      this.manualTradeState.set(chatId, {
         action: "sell",
         awaitingAmount: false,
         maxAmount: silverBalance,
         currentPrice: apiPrice, // Store API price for order
-      };
+      });
 
       await ctx.reply(
         `📤 *Sell Silver*\n\n` +

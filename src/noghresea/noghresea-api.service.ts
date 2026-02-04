@@ -85,8 +85,21 @@ export class NoghreseaApiService {
     private telegramBot: TelegramBotService,
   ) {}
 
+  // Track active chat ID for API operations
+  private activeChatId: string | null = null;
+
+  setActiveChatId(chatId: string) {
+    this.activeChatId = chatId;
+  }
+
+  getActiveChatId(): string | null {
+    return this.activeChatId;
+  }
+
   private async handleAuthError() {
-    await this.authService.invalidateToken();
+    if (this.activeChatId) {
+      await this.authService.invalidateToken(this.activeChatId);
+    }
     await this.telegramBot.sendAuthRequired();
   }
 
@@ -98,12 +111,15 @@ export class NoghreseaApiService {
     method: "GET" | "POST" = "GET",
     body?: any,
   ): Promise<T | null> {
-    if (!this.authService.isAuthenticated()) {
-      this.logger.warn(`${endpoint}: Not authenticated`);
+    if (
+      !this.activeChatId ||
+      !this.authService.isAuthenticated(this.activeChatId)
+    ) {
+      this.logger.warn(`${endpoint}: Not authenticated or no active chat`);
       return null;
     }
 
-    const token = this.authService.getToken();
+    const token = this.authService.getToken(this.activeChatId);
 
     try {
       const response = await this.browserSession.makeRequest(
