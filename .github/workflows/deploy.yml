@@ -26,18 +26,18 @@ jobs:
                       # Pull latest code
                       git pull origin main
 
+                      # Remove dangling images first (save space before build)
+                      docker image prune -f
+
                       # Stop and remove old containers
                       docker-compose down --remove-orphans
 
-                      # Remove all dangling images before building
-                      docker image prune -af --filter "dangling=true"
+                      # Build and start new containers
+                      docker-compose up -d --build
 
-                      # Build and start new containers (no cache to save space)
-                      docker-compose build --no-cache --pull
-                      docker-compose up -d
+                      # Clean up: remove unused images and build cache (but keep volumes and running containers)
+                      docker image prune -af
+                      docker builder prune -af
 
-                      # Aggressive cleanup: remove ALL unused images, containers, networks, and build cache
-                      docker system prune -af --volumes
-
-                      echo "Deployment completed successfully!"
-                      echo "Storage cleanup completed!"
+                      echo "✅ Deployment completed successfully!"
+                      echo "🧹 Storage cleanup completed!"
