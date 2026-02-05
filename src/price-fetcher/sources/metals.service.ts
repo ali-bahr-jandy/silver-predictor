@@ -1,5 +1,6 @@
 import { Injectable, Logger } from "@nestjs/common";
 import axios from "axios";
+import * as https from "https";
 import { GRAMS_PER_OUNCE, GRAMS_PER_MESGHAL } from "../../common/constants";
 
 export interface MetalPrices {
@@ -55,14 +56,22 @@ export class MetalsService {
    */
   private async tryGoldApiCom(): Promise<MetalPrices | null> {
     try {
+      // Create HTTPS agent with DNS family set to IPv4
+      const httpsAgent = new https.Agent({
+        family: 4, // Force IPv4
+        lookup: require("dns").lookup,
+      });
+
       const [silverRes, goldRes] = await Promise.all([
         axios.get("https://api.gold-api.com/price/XAG", {
-          timeout: 5000,
+          timeout: 10000,
           headers: { "User-Agent": "Mozilla/5.0" },
+          httpsAgent,
         }),
         axios.get("https://api.gold-api.com/price/XAU", {
-          timeout: 5000,
+          timeout: 10000,
           headers: { "User-Agent": "Mozilla/5.0" },
+          httpsAgent,
         }),
       ]);
 
