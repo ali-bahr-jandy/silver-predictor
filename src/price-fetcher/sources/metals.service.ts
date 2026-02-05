@@ -69,11 +69,15 @@ export class MetalsService {
       const silverPrice = silverRes.data?.price;
       const goldPrice = goldRes.data?.price;
 
+      this.logger.debug(
+        `Gold API response: Silver=${silverPrice}, Gold=${goldPrice}`,
+      );
+
       // Silver is currently ~$118/oz in 2026, validate reasonable range
       if (silverPrice > 50 && silverPrice < 500) {
         this.lastKnownPrices = {
           silverOunce: silverPrice,
-          goldOunce: goldPrice || 0,
+          goldOunce: goldPrice && goldPrice > 1000 ? goldPrice : null,
           timestamp: new Date(),
           source: "gold-api.com",
           isEstimated: false,
@@ -81,6 +85,7 @@ export class MetalsService {
         return this.lastKnownPrices;
       }
     } catch (error: any) {
+      this.logger.warn(`Gold API failed: ${error.message}`);
       // Silently fail - will try fallback
     }
 
@@ -104,7 +109,7 @@ export class MetalsService {
       if (silver?.price > 50 && silver?.price < 500) {
         this.lastKnownPrices = {
           silverOunce: silver.price,
-          goldOunce: gold?.price || 0,
+          goldOunce: gold?.price && gold.price > 1000 ? gold.price : null,
           timestamp: new Date(),
           source: "metals.live",
           isEstimated: false,

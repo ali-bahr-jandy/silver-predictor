@@ -115,7 +115,7 @@ export class PriceFetcherService {
 
     const silverSource = silverIsEstimated ? "(est)" : "";
     this.logger.log(
-      `💰 Prices: Noghresea=${noghresea?.price?.toFixed(2)}, Silver=$${silverOunce?.toFixed(2)}${silverSource}, USDT=${wallex?.usdtToman}`,
+      `💰 Prices: Noghresea=${noghresea?.price?.toFixed(2)}, Silver=$${silverOunce?.toFixed(2)}${silverSource}, Gold=$${this.lastPrices.goldOunce?.toFixed(2) || "N/A"}, USDT=${wallex?.usdtToman}`,
     );
 
     return this.lastPrices;
