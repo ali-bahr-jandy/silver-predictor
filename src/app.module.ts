@@ -59,9 +59,8 @@ import { validate } from "./common/env.validation";
           UserTradingSettings,
           UserTradeHistory,
         ],
-        // WARNING: synchronize should be false in production!
-        // Use migrations instead: npm run migration:generate -- -n MigrationName
-        synchronize: process.env.NODE_ENV !== "production",
+        // Auto-sync schema with entities
+        synchronize: true,
         logging: process.env.DB_LOGGING === "true",
       }),
       inject: [ConfigService],
