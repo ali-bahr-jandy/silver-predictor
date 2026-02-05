@@ -66,6 +66,12 @@ ${this.formatTradeHistory(recentTrades)}
 ## HISTORICAL SIMILAR PATTERNS
 ${this.formatSimilarPatterns(similarPatterns)}
 
+## TRADING FEE CONSIDERATION
+- **Fee per transaction**: 1% of transaction value
+- **Round-trip fee (BUY + SELL)**: 2% total
+- **CRITICAL**: Only recommend trading if expected profit > 2% to cover fees
+- If expected price movement is < 2%, suggest HOLD to avoid losing money on fees
+
 ## CRITICAL: MANIPULATION DETECTION STRATEGY
 The price changer on noghresea.ir has a PREDICTABLE pattern:
 
@@ -96,8 +102,10 @@ Analyze the current situation and decide:
 1. **action**: "BUY", "SELL", or "HOLD"
 2. **confidence**: 0-100 (how confident are you)
 3. **volume_percent**: 1-5 (what % of available balance to use, use 3-5 for DROP_BOTTOM)
-4. **reasoning**: Brief explanation of your decision
-5. **expected_outcome**: What you expect to happen next
+4. **reasoning**: Brief explanation of your decision (include fee consideration!)
+5. **expected_outcome**: What you expect to happen next (indicate expected % gain)
+
+**REMEMBER**: Each trade costs 1% fee. Round-trip (BUY→SELL) costs 2%. Only trade if you expect >2% profit!
 
 Respond in JSON format only:
 {

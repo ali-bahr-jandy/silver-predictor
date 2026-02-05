@@ -16,6 +16,7 @@ import { AllPrices } from "../price-fetcher/price-fetcher.service";
 import { PatternAnalysis } from "../pattern-analyzer/pattern-analyzer.service";
 import { DailyAnalysisService } from "../analysis/daily-analysis.service";
 import { TransactionService } from "../trade-executor/transaction.service";
+import { UserTradingService } from "../trade-executor/user-trading.service";
 
 // State for manual trading flow
 interface ManualTradeState {
@@ -28,7 +29,7 @@ interface ManualTradeState {
 @Injectable()
 export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramBotService.name);
-  private bot: Telegraf;
+  private bot!: Telegraf;
   private chatId: string | null = null;
   // Removed global awaitingOtp and awaitingPhone - now per-user in authService
   private tradeExecutor: any = null; // Will be injected later to avoid circular dep
@@ -36,7 +37,9 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
   private transactionService: TransactionService | null = null;
   private priceFetcher: any = null;
   private patternAnalyzer: any = null;
+  private userTradingService: UserTradingService | null = null;
   private manualTradeState: Map<string, ManualTradeState> = new Map(); // Per-user trade state
+  private awaitingCustomPercent: Map<string, boolean> = new Map(); // Per-user state for custom % input
 
   constructor(
     private configService: ConfigService,
@@ -77,6 +80,10 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     this.patternAnalyzer = service;
   }
 
+  setUserTradingService(service: UserTradingService) {
+    this.userTradingService = service;
+  }
+
   async onModuleInit() {
     if (!this.bot) {
       this.logger.warn("Telegram bot not configured - no token provided");
@@ -87,8 +94,11 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
     this.setupHandlers();
 
     // Add error handling for the bot
-    this.bot.catch((err: Error, ctx) => {
-      this.logger.error(`Telegraf error for ${ctx.updateType}: ${err.message}`);
+    this.bot.catch((err: unknown, ctx) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        `Telegraf error for ${ctx.updateType}: ${errorMessage}`,
+      );
     });
 
     // Launch bot with explicit options
@@ -190,6 +200,29 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      // Handle custom percent input
+      const chatId = ctx.chat?.id?.toString();
+      if (
+        chatId &&
+        this.awaitingCustomPercent.get(chatId) &&
+        /^\d+$/.test(text)
+      ) {
+        const percent = parseInt(text);
+        if (percent >= 1 && percent <= 100 && this.userTradingService) {
+          await this.userTradingService.updateTradeAmount(
+            chatId,
+            "percentage",
+            percent,
+          );
+          this.awaitingCustomPercent.delete(chatId);
+          await ctx.reply(`✅ Trade amount set to ${percent}% of balance`);
+          await this.showTradeSettings(ctx);
+        } else {
+          await ctx.reply("❌ Please enter a number between 1 and 100");
+        }
+        return;
+      }
+
       return next();
     });
 
@@ -213,7 +246,7 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
             ["▶️ Start Bot", "⏸️ Stop Bot"],
             ["💰 Buy", "📤 Sell"],
             ["📜 History", "💳 Transactions"],
-            ["📈 Daily Report", "⚙️ Settings"],
+            ["🤖 AI Analyzer", "⚙️ Settings"],
           ]).resize(),
         },
       );
@@ -574,20 +607,133 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    // Settings
+    // Settings - Enhanced with trade settings
     this.bot.hears("⚙️ Settings", async (ctx) => {
-      const threshold = this.configService.get("CONFIDENCE_THRESHOLD", "70");
-      const maxTrade = this.configService.get("MAX_TRADE_PERCENT", "5");
-      const interval = this.configService.get("POLLING_INTERVAL_MS", "10000");
+      await this.showTradeSettings(ctx);
+    });
 
+    // ============ TRADE SETTINGS ACTIONS ============
+
+    // Trade percent quick buttons
+    this.bot.action(/set_percent_(\d+)/, async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      const percent = parseInt(ctx.match[1]);
+      await this.userTradingService.updateTradeAmount(
+        chatId,
+        "percentage",
+        percent,
+      );
+      await ctx.answerCbQuery(`✅ Trade amount set to ${percent}%`);
+      await this.showTradeSettings(ctx);
+    });
+
+    // Custom percent input trigger
+    this.bot.action("set_custom_percent", async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId) return;
+
+      this.awaitingCustomPercent.set(chatId, true);
+      await ctx.answerCbQuery();
       await ctx.reply(
-        `⚙️ *Current Settings*\n\n` +
-          `• Confidence Threshold: ${threshold}%\n` +
-          `• Max Trade: ${maxTrade}% of balance\n` +
-          `• Polling Interval: ${parseInt(interval) / 1000}s\n` +
-          `• Trading: ${this.tradeExecutor?.isTradingEnabled() ? "✅ Enabled" : "❌ Disabled"}`,
+        "📝 *Enter Custom Trade Percent*\n\n" +
+          "Enter a number between 1 and 100:\n" +
+          "Example: `25` for 25% of your balance",
         { parse_mode: "Markdown" },
       );
+    });
+
+    // Min confidence buttons
+    this.bot.action(/set_confidence_(\d+)/, async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      const confidence = parseInt(ctx.match[1]);
+      await this.userTradingService.updateMinConfidence(chatId, confidence);
+      await ctx.answerCbQuery(`✅ Min confidence set to ${confidence}%`);
+      await this.showTradeSettings(ctx);
+    });
+
+    // Toggle auto trading
+    this.bot.action(/toggle_auto_(on|off)/, async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      const enabled = ctx.match[1] === "on";
+      await this.userTradingService.toggleAutoTrading(chatId, enabled);
+      await ctx.answerCbQuery(
+        `✅ Auto trading ${enabled ? "enabled" : "disabled"}`,
+      );
+      await this.showTradeSettings(ctx);
+    });
+
+    // View trade history
+    this.bot.action("view_trade_history", async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      await ctx.answerCbQuery();
+      const history = await this.userTradingService.getTradeHistory(chatId, 10);
+
+      if (history.length === 0) {
+        await ctx.reply("📜 No trade history found.");
+        return;
+      }
+
+      let message = "📜 *Recent Trades (Last 10)*\n\n";
+      for (const trade of history) {
+        const emoji = trade.action === "BUY" ? "💰" : "📤";
+        const source = trade.source === "AI" ? "🤖" : "👤";
+        const date = new Date(trade.executedAt).toLocaleString("fa-IR");
+        message += `${emoji} ${trade.action} ${trade.silverAmount.toFixed(2)}g @ ${Number(trade.pricePerGram).toLocaleString()} ${source}\n`;
+        message += `   ${date}\n\n`;
+      }
+
+      await ctx.reply(message, { parse_mode: "Markdown" });
+    });
+
+    // View session status
+    this.bot.action("view_session", async (ctx) => {
+      const chatId = ctx.chat?.id.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      await ctx.answerCbQuery();
+      const session = await this.userTradingService.getSessionStatus(chatId);
+
+      if (!session.hasActiveSession) {
+        await ctx.reply(
+          "📊 *No Active Session*\n\n" +
+            "Start a session by making your first AI trade.",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+
+      const position =
+        session.currentPosition === "silver" ? "🪙 Silver" : "💵 Toman";
+      const amount =
+        session.currentPosition === "silver"
+          ? `${session.silverAmount?.toFixed(2)}g`
+          : `${session.tomanAmount?.toLocaleString()} T`;
+      const pl = session.profitLossPercent
+        ? `${session.profitLossPercent >= 0 ? "+" : ""}${session.profitLossPercent.toFixed(2)}%`
+        : "N/A";
+
+      await ctx.reply(
+        `📊 *Active Trading Session*\n\n` +
+          `Position: ${position}\n` +
+          `Amount: ${amount}\n` +
+          `Trades: ${session.tradeCount}\n` +
+          `P/L: ${pl}`,
+        { parse_mode: "Markdown" },
+      );
+    });
+
+    // Back to settings
+    this.bot.action("back_to_settings", async (ctx) => {
+      await ctx.answerCbQuery();
+      await this.showTradeSettings(ctx);
     });
 
     // ============ MANUAL TRADING ============
@@ -955,29 +1101,102 @@ export class TelegramBotService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    // Daily Report
-    this.bot.hears("📈 Daily Report", async (ctx) => {
-      await ctx.reply("📊 Generating daily report...");
+    // AI Analyzer - Comprehensive AI trade analysis
+    this.bot.hears("🤖 AI Analyzer", async (ctx) => {
+      await this.showAiAnalyzer(ctx, "month");
+    });
 
-      if (!this.dailyAnalysis) {
-        await ctx.reply("❌ Daily analysis service not available.");
-        return;
-      }
+    // AI Analyzer period actions
+    this.bot.action(/ai_analyze_(week|month|quarter|year)/, async (ctx) => {
+      const period = ctx.match[1] as "week" | "month" | "quarter" | "year";
+      await ctx.answerCbQuery();
+      await this.showAiAnalyzer(ctx, period);
+    });
+
+    // AI Analyzer detailed view
+    this.bot.action("ai_monthly_breakdown", async (ctx) => {
+      const chatId = ctx.chat?.id?.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      await ctx.answerCbQuery();
 
       try {
-        // Generate or get today's summary
-        const summary = await this.dailyAnalysis.generateDailySummary();
+        const analysis = await this.userTradingService.getAiTradeAnalysis(
+          undefined,
+          "year",
+        );
 
-        if (!summary) {
-          await ctx.reply(
-            "⚠️ Not enough data for daily report. Keep collecting data!",
-          );
+        if (analysis.monthlyBreakdown.length === 0) {
+          await ctx.reply("📊 No monthly data available yet.");
           return;
         }
 
-        await ctx.reply(summary.notes, { parse_mode: "Markdown" });
+        let message = "📅 *Monthly AI Performance Breakdown*\n\n";
+
+        for (const month of analysis.monthlyBreakdown) {
+          const emoji = month.successRate >= 50 ? "✅" : "❌";
+          const plEmoji = month.profitLoss >= 0 ? "📈" : "📉";
+          message +=
+            `*${month.month}*\n` +
+            `${emoji} Success: ${month.successRate.toFixed(1)}% (${month.successfulTrades}/${month.trades})\n` +
+            `${plEmoji} P/L: ${month.profitLoss >= 0 ? "+" : ""}${month.profitLoss.toLocaleString()} T\n\n`;
+        }
+
+        await ctx.reply(message, {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("← Back to Analyzer", "ai_analyze_month")],
+          ]),
+        });
       } catch (error: any) {
-        await ctx.reply(`❌ Error generating report: ${error.message}`);
+        await ctx.reply(`❌ Error: ${error.message}`);
+      }
+    });
+
+    // AI Analyzer all-time stats
+    this.bot.action("ai_all_time", async (ctx) => {
+      const chatId = ctx.chat?.id?.toString();
+      if (!chatId || !this.userTradingService) return;
+
+      await ctx.answerCbQuery();
+
+      try {
+        const stats = await this.userTradingService.getAllTimeAiStats();
+
+        if (stats.totalTrades === 0) {
+          await ctx.reply("📊 No AI trades recorded yet.");
+          return;
+        }
+
+        const firstDate = stats.firstTradeDate
+          ? stats.firstTradeDate.toLocaleDateString("fa-IR")
+          : "N/A";
+        const lastDate = stats.lastTradeDate
+          ? stats.lastTradeDate.toLocaleDateString("fa-IR")
+          : "N/A";
+        const plEmoji = stats.overallProfitLoss >= 0 ? "📈" : "📉";
+        const successEmoji = stats.overallSuccessRate >= 50 ? "✅" : "⚠️";
+
+        const message =
+          `🏆 *All-Time AI Performance*\n\n` +
+          `📅 First Trade: ${firstDate}\n` +
+          `📅 Last Trade: ${lastDate}\n` +
+          `⏰ Days Active: ${stats.totalDaysActive}\n\n` +
+          `📊 *Trading Volume*\n` +
+          `• Total Trades: ${stats.totalTrades}\n` +
+          `• Silver Volume: ${stats.totalVolumeSilver.toFixed(2)}g\n` +
+          `• Toman Volume: ${stats.totalVolumeToman.toLocaleString()} T\n\n` +
+          `${successEmoji} *Success Rate: ${stats.overallSuccessRate.toFixed(1)}%*\n` +
+          `${plEmoji} *Total P/L: ${stats.overallProfitLoss >= 0 ? "+" : ""}${stats.overallProfitLoss.toLocaleString()} T*`;
+
+        await ctx.reply(message, {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.callback("← Back to Analyzer", "ai_analyze_month")],
+          ]),
+        });
+      } catch (error: any) {
+        await ctx.reply(`❌ Error: ${error.message}`);
       }
     });
 
@@ -1530,6 +1749,292 @@ ${patterns}
     } catch (error: any) {
       this.logger.error(`Sell handler error: ${error.message}`);
       await ctx.reply(`❌ Error: ${error.message}`);
+    }
+  }
+
+  /**
+   * Show comprehensive trade settings with inline buttons
+   */
+  private async showTradeSettings(ctx: any) {
+    const chatId = ctx.chat?.id?.toString();
+    if (!chatId) return;
+
+    if (!this.userTradingService) {
+      await ctx.reply("❌ Trade settings service not available.");
+      return;
+    }
+
+    const settings = await this.userTradingService.getOrCreateSettings(chatId);
+    const interval = this.configService.get("POLLING_INTERVAL_MS", "10000");
+
+    const modeText =
+      settings.tradeMode === "percentage"
+        ? `${Number(settings.tradePercent)}% of balance`
+        : `${settings.fixedSilverGrams?.toFixed(2) || "N/A"} grams fixed`;
+
+    const autoText = settings.autoTradingEnabled ? "✅ ON" : "❌ OFF";
+    const tradingText = this.tradeExecutor?.isTradingEnabled()
+      ? "✅ Running"
+      : "⏸️ Paused";
+
+    const message =
+      `⚙️ *Trade Settings*\n\n` +
+      `📊 *Trade Amount:* ${modeText}\n` +
+      `🎯 *Min Confidence:* ${Number(settings.minConfidence)}%\n` +
+      `🤖 *Auto Trading:* ${autoText}\n` +
+      `🔄 *Bot Status:* ${tradingText}\n` +
+      `⏱️ *Check Interval:* ${parseInt(interval) / 1000}s\n` +
+      `🛡️ *Max Loss:* ${Number(settings.maxLossPercent)}%`;
+
+    // Edit message if it's a callback, otherwise send new
+    const replyMethod = ctx.callbackQuery
+      ? ctx.editMessageText.bind(ctx)
+      : ctx.reply.bind(ctx);
+
+    await replyMethod(message, {
+      parse_mode: "Markdown",
+      ...Markup.inlineKeyboard([
+        // Trade percent row 1
+        [
+          Markup.button.callback(
+            settings.tradePercent == 3 ? "✓ 3%" : "3%",
+            "set_percent_3",
+          ),
+          Markup.button.callback(
+            settings.tradePercent == 5 ? "✓ 5%" : "5%",
+            "set_percent_5",
+          ),
+          Markup.button.callback(
+            settings.tradePercent == 10 ? "✓ 10%" : "10%",
+            "set_percent_10",
+          ),
+          Markup.button.callback(
+            settings.tradePercent == 20 ? "✓ 20%" : "20%",
+            "set_percent_20",
+          ),
+        ],
+        // Trade percent row 2
+        [
+          Markup.button.callback(
+            settings.tradePercent == 50 ? "✓ 50%" : "50%",
+            "set_percent_50",
+          ),
+          Markup.button.callback(
+            settings.tradePercent == 100 ? "✓ 100%" : "100%",
+            "set_percent_100",
+          ),
+          Markup.button.callback("Custom %", "set_custom_percent"),
+        ],
+        // Confidence row
+        [
+          Markup.button.callback(
+            settings.minConfidence == 60 ? "✓ 60%" : "60%",
+            "set_confidence_60",
+          ),
+          Markup.button.callback(
+            settings.minConfidence == 70 ? "✓ 70%" : "70%",
+            "set_confidence_70",
+          ),
+          Markup.button.callback(
+            settings.minConfidence == 80 ? "✓ 80%" : "80%",
+            "set_confidence_80",
+          ),
+          Markup.button.callback(
+            settings.minConfidence == 90 ? "✓ 90%" : "90%",
+            "set_confidence_90",
+          ),
+        ],
+        // Auto trading toggle
+        [
+          Markup.button.callback(
+            settings.autoTradingEnabled ? "🤖 Disable Auto" : "🤖 Enable Auto",
+            settings.autoTradingEnabled ? "toggle_auto_off" : "toggle_auto_on",
+          ),
+        ],
+        // History and session
+        [
+          Markup.button.callback("📜 Trade History", "view_trade_history"),
+          Markup.button.callback("📊 Session", "view_session"),
+        ],
+      ]),
+    });
+  }
+
+  /**
+   * Show comprehensive AI trade analyzer with period selection
+   */
+  private async showAiAnalyzer(
+    ctx: any,
+    period: "week" | "month" | "quarter" | "year",
+  ) {
+    if (!this.userTradingService) {
+      await ctx.reply("❌ AI analyzer service not available.");
+      return;
+    }
+
+    const loading = ctx.callbackQuery
+      ? null
+      : await ctx.reply("🔄 Analyzing AI trades...");
+
+    try {
+      const analysis = await this.userTradingService.getAiTradeAnalysis(
+        undefined, // All users
+        period,
+      );
+
+      const periodLabel = {
+        week: "Last 7 Days",
+        month: "Last 30 Days",
+        quarter: "Last 90 Days",
+        year: "Last 365 Days",
+      }[period];
+
+      if (analysis.totalTrades === 0) {
+        const noDataMsg =
+          `🤖 *AI Trade Analyzer*\n` +
+          `📅 Period: ${periodLabel}\n\n` +
+          `❌ No AI trades found in this period.\n\n` +
+          `AI trades will appear here once the bot executes trades automatically.`;
+
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(noDataMsg, {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([
+              [
+                Markup.button.callback(
+                  period === "week" ? "✓ Week" : "Week",
+                  "ai_analyze_week",
+                ),
+                Markup.button.callback(
+                  period === "month" ? "✓ Month" : "Month",
+                  "ai_analyze_month",
+                ),
+                Markup.button.callback(
+                  period === "quarter" ? "✓ Quarter" : "Quarter",
+                  "ai_analyze_quarter",
+                ),
+                Markup.button.callback(
+                  period === "year" ? "✓ Year" : "Year",
+                  "ai_analyze_year",
+                ),
+              ],
+            ]),
+          });
+        } else {
+          await ctx.reply(noDataMsg, {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([
+              [
+                Markup.button.callback("Week", "ai_analyze_week"),
+                Markup.button.callback("✓ Month", "ai_analyze_month"),
+                Markup.button.callback("Quarter", "ai_analyze_quarter"),
+                Markup.button.callback("Year", "ai_analyze_year"),
+              ],
+            ]),
+          });
+        }
+        return;
+      }
+
+      // Build the analysis message
+      const successEmoji = analysis.successRate >= 50 ? "✅" : "⚠️";
+      const plEmoji = analysis.netProfitLoss >= 0 ? "📈" : "📉";
+      const highConfEmoji =
+        analysis.highConfidenceSuccessRate >= 50 ? "🎯" : "⚠️";
+
+      let message =
+        `🤖 *AI Trade Analyzer*\n` +
+        `📅 Period: ${periodLabel}\n\n` +
+        `📊 *Trade Summary*\n` +
+        `• Total Trades: ${analysis.totalTrades}\n` +
+        `• Buys: ${analysis.buyTrades} | Sells: ${analysis.sellTrades}\n` +
+        `• Complete Pairs: ${analysis.tradePairs.length}\n\n` +
+        `${successEmoji} *Success Rate: ${analysis.successRate.toFixed(1)}%*\n` +
+        `• Successful: ${analysis.successfulTrades}\n` +
+        `• Failed: ${analysis.failedTrades}\n\n` +
+        `${plEmoji} *Profit/Loss*\n` +
+        `• Gross: ${analysis.netProfitLoss >= 0 ? "+" : ""}${analysis.netProfitLoss.toLocaleString()} T\n` +
+        `• Fees Paid (${analysis.feePercent}%): -${analysis.totalFeesPaid.toLocaleString()} T\n` +
+        `• Net (after fees): ${analysis.netProfitLossAfterFees >= 0 ? "+" : ""}${analysis.netProfitLossAfterFees.toLocaleString()} T\n` +
+        `• Percent: ${analysis.netProfitLossPercent >= 0 ? "+" : ""}${analysis.netProfitLossPercent.toFixed(2)}%\n\n` +
+        `💰 *Volume*\n` +
+        `• Silver Bought: ${analysis.totalSilverBought.toFixed(2)}g\n` +
+        `• Silver Sold: ${analysis.totalSilverSold.toFixed(2)}g\n` +
+        `• Toman Spent: ${analysis.totalTomanSpent.toLocaleString()}\n` +
+        `• Toman Received: ${analysis.totalTomanReceived.toLocaleString()}\n\n` +
+        `📈 *Averages*\n` +
+        `• Avg Buy Price: ${analysis.avgBuyPrice.toLocaleString()} T/g\n` +
+        `• Avg Sell Price: ${analysis.avgSellPrice.toLocaleString()} T/g\n` +
+        `• Avg Confidence: ${analysis.avgConfidence.toFixed(1)}%\n\n` +
+        `${highConfEmoji} *Confidence Analysis*\n` +
+        `• High (≥80%): ${analysis.highConfidenceSuccessRate.toFixed(1)}% success\n` +
+        `• Low (<80%): ${analysis.lowConfidenceSuccessRate.toFixed(1)}% success`;
+
+      // Add best/worst trade if available
+      if (analysis.bestTrade) {
+        message +=
+          `\n\n🏆 *Best Trade*\n` +
+          `• ${analysis.bestTrade.silverAmount.toFixed(2)}g\n` +
+          `• Buy: ${analysis.bestTrade.buyPrice.toLocaleString()} → Sell: ${analysis.bestTrade.sellPrice.toLocaleString()}\n` +
+          `• P/L: +${analysis.bestTrade.profitLossPercent.toFixed(2)}%`;
+      }
+
+      if (analysis.worstTrade) {
+        message +=
+          `\n\n❌ *Worst Trade*\n` +
+          `• ${analysis.worstTrade.silverAmount.toFixed(2)}g\n` +
+          `• Buy: ${analysis.worstTrade.buyPrice.toLocaleString()} → Sell: ${analysis.worstTrade.sellPrice.toLocaleString()}\n` +
+          `• P/L: ${analysis.worstTrade.profitLossPercent.toFixed(2)}%`;
+      }
+
+      const replyMethod = ctx.callbackQuery
+        ? ctx.editMessageText.bind(ctx)
+        : ctx.reply.bind(ctx);
+
+      await replyMethod(message, {
+        parse_mode: "Markdown",
+        ...Markup.inlineKeyboard([
+          // Period selection
+          [
+            Markup.button.callback(
+              period === "week" ? "✓ Week" : "Week",
+              "ai_analyze_week",
+            ),
+            Markup.button.callback(
+              period === "month" ? "✓ Month" : "Month",
+              "ai_analyze_month",
+            ),
+            Markup.button.callback(
+              period === "quarter" ? "✓ Quarter" : "Quarter",
+              "ai_analyze_quarter",
+            ),
+            Markup.button.callback(
+              period === "year" ? "✓ Year" : "Year",
+              "ai_analyze_year",
+            ),
+          ],
+          // Detail views
+          [
+            Markup.button.callback(
+              "📅 Monthly Breakdown",
+              "ai_monthly_breakdown",
+            ),
+            Markup.button.callback("🏆 All-Time Stats", "ai_all_time"),
+          ],
+        ]),
+      });
+
+      // Delete loading message if we sent one
+      if (loading) {
+        try {
+          await ctx.deleteMessage(loading.message_id);
+        } catch {
+          // Ignore if message already deleted
+        }
+      }
+    } catch (error: any) {
+      this.logger.error(`AI analyzer error: ${error.message}`);
+      await ctx.reply(`❌ Error analyzing AI trades: ${error.message}`);
     }
   }
 }

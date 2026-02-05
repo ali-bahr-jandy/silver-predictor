@@ -52,9 +52,26 @@ export class NoghreseaAuthService implements OnModuleInit {
 
   async loadUserAuth(chatId: string): Promise<void> {
     try {
-      const auth = await this.authStateRepo.findOne({
+      // First try to find by chat ID
+      let auth = await this.authStateRepo.findOne({
         where: { telegramChatId: chatId, isValid: true },
       });
+
+      // If not found by chat ID, try to find any valid auth (for backward compatibility)
+      if (!auth) {
+        auth = await this.authStateRepo.findOne({
+          where: { isValid: true },
+          order: { updatedAt: "DESC" },
+        });
+        if (auth) {
+          this.logger.log(
+            `📱 Found valid auth for phone ${auth.phoneNumber}, linking to chat ${chatId}`,
+          );
+          // Update the telegram chat ID to current one
+          auth.telegramChatId = chatId;
+          await this.authStateRepo.save(auth);
+        }
+      }
 
       const state = this.getUserState(chatId);
       if (auth && auth.isValid && auth.accessToken) {
@@ -162,19 +179,28 @@ export class NoghreseaAuthService implements OnModuleInit {
         );
         const expiresAt = new Date(payload.exp * 1000);
 
-        // Save to DB - per user
+        // Save to DB - use phone number as primary identifier
         let auth = await this.authStateRepo.findOne({
-          where: { telegramChatId: chatId },
+          where: { phoneNumber },
         });
 
         if (!auth) {
+          // Create new auth record
           auth = this.authStateRepo.create({
             telegramChatId: chatId,
             phoneNumber,
           });
+          this.logger.log(
+            `🆕 Creating new auth record for phone ${phoneNumber}`,
+          );
+        } else {
+          // Update existing auth record with new chat ID (device switch)
+          this.logger.log(
+            `🔄 Updating existing auth for phone ${phoneNumber} from chat ${auth.telegramChatId} to ${chatId}`,
+          );
+          auth.telegramChatId = chatId;
         }
 
-        auth.phoneNumber = phoneNumber;
         auth.accessToken = state.accessToken!;
         auth.tokenExpiresAt = expiresAt;
         auth.isValid = true;
@@ -206,18 +232,49 @@ export class NoghreseaAuthService implements OnModuleInit {
     return !!state.accessToken;
   }
 
+  async isPhoneNumberAuthorized(phoneNumber: string): Promise<boolean> {
+    try {
+      const auth = await this.authStateRepo.findOne({
+        where: { phoneNumber, isValid: true },
+      });
+      return !!auth && !!auth.accessToken;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async getAuthByPhoneNumber(phoneNumber: string): Promise<AuthState | null> {
+    try {
+      return await this.authStateRepo.findOne({
+        where: { phoneNumber, isValid: true },
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+
   async invalidateToken(chatId: string) {
     const state = this.getUserState(chatId);
+    const phoneNumber = state.phoneNumber;
+
     state.accessToken = null;
     state.phoneNumber = null;
     state.awaitingOtp = false;
     state.awaitingPhone = false;
 
-    await this.authStateRepo.update(
-      { telegramChatId: chatId },
-      { isValid: false },
-    );
-
-    this.logger.warn(`Token invalidated for chat ${chatId}`);
+    // Invalidate by phone number (primary identifier)
+    if (phoneNumber) {
+      await this.authStateRepo.update({ phoneNumber }, { isValid: false });
+      this.logger.warn(
+        `Token invalidated for phone ${phoneNumber} (chat ${chatId})`,
+      );
+    } else {
+      // Fallback to chat ID if phone number not available
+      await this.authStateRepo.update(
+        { telegramChatId: chatId },
+        { isValid: false },
+      );
+      this.logger.warn(`Token invalidated for chat ${chatId}`);
+    }
   }
 }

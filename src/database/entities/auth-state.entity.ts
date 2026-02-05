@@ -7,15 +7,15 @@ import {
 } from "typeorm";
 
 @Entity("auth_state")
-@Index(["telegramChatId"], { unique: true })
+@Index(["phoneNumber"], { unique: true })
 export class AuthState {
   @PrimaryGeneratedColumn("uuid")
   id: string;
 
-  @Column({ name: "telegram_chat_id" })
+  @Column({ name: "telegram_chat_id", nullable: true })
   telegramChatId: string;
 
-  @Column({ name: "phone_number", nullable: true })
+  @Column({ name: "phone_number", unique: true })
   phoneNumber: string;
 
   @Column({ type: "text", name: "access_token", nullable: true })

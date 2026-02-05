@@ -23,6 +23,9 @@ import { AuthState } from "./database/entities/auth-state.entity";
 import { AiDecision } from "./database/entities/ai-decision.entity";
 import { DailySummary } from "./database/entities/daily-summary.entity";
 import { Transaction } from "./database/entities/transaction.entity";
+import { AiPrediction } from "./database/entities/ai-prediction.entity";
+import { UserTradingSettings } from "./database/entities/user-trading-settings.entity";
+import { UserTradeHistory } from "./database/entities/user-trade-history.entity";
 import { validate } from "./common/env.validation";
 
 @Module({
@@ -52,6 +55,9 @@ import { validate } from "./common/env.validation";
           AiDecision,
           DailySummary,
           Transaction,
+          AiPrediction,
+          UserTradingSettings,
+          UserTradeHistory,
         ],
         // WARNING: synchronize should be false in production!
         // Use migrations instead: npm run migration:generate -- -n MigrationName
