@@ -69,12 +69,12 @@ export class MetalsService {
       const silverPrice = silverRes.data?.price;
       const goldPrice = goldRes.data?.price;
 
-      this.logger.debug(
-        `Gold API response: Silver=${silverPrice}, Gold=${goldPrice}`,
+      this.logger.log(
+        `✅ Gold API success: Silver=$${silverPrice?.toFixed(2)}, Gold=$${goldPrice?.toFixed(2)}`,
       );
 
-      // Silver is currently ~$118/oz in 2026, validate reasonable range
-      if (silverPrice > 50 && silverPrice < 500) {
+      // Validate reasonable range for silver ($20-200)
+      if (silverPrice && silverPrice > 20 && silverPrice < 200) {
         this.lastKnownPrices = {
           silverOunce: silverPrice,
           goldOunce: goldPrice && goldPrice > 1000 ? goldPrice : null,
